@@ -1,0 +1,445 @@
+---
+title: "JSC370 Assignment 2"
+author: "Michael J. Moon"
+date: '2020-02-26'
+header-includes:
+   - \usepackage{pgf}
+   - \usepackage{tikz}
+   - \usepackage{subfig}
+   - \usepackage{caption}
+output: 
+  pdf_document:
+    highlight: tango
+    keep_tex: true
+---
+ <!-- latex macros for in-caption legends -->
+\definecolor{color1}{HTML}{7FC97F}
+\definecolor{color2}{HTML}{BEAED4}
+\definecolor{color3}{HTML}{FDC086}
+\definecolor{color4}{HTML}{FFFF99}
+\definecolor{color5}{HTML}{386CB0}
+\definecolor{color6}{HTML}{F0027F}
+\definecolor{color7}{HTML}{BF5B17}
+\definecolor{color8}{HTML}{666666}
+
+\newcommand{\linlegend}[1]{\textcolor{#1}{
+    \protect\tikz[baseline=-0.5ex, line width=0.5ex]
+    \protect\draw (0,0) -- (3ex,0);
+}}
+\newcommand{\dashlegend}[1]{\textcolor{#1}{
+    \protect\tikz[baseline=-0.5ex, line width=0.5ex]
+    \protect\draw[dashed] (0,0) -- (3ex,0);
+}}
+\newcommand{\dotlegend}[1]{
+	\protect\tikz \protect\fill[#1] (0.5ex,0.5ex) circle (0.5ex);
+}
+\newcommand{\circlegend}[1]{
+	\protect\tikz \protect\draw[#1] (0.5ex,0.5ex) circle (0.5ex);
+}
+\newcommand{\barlegend}[1]{\protect{
+  \textcolor{#1}{\rule[0ex]{1ex}{1.5ex}}
+}}
+<!-- set caption width -->
+\captionsetup{width=.7\linewidth}
+
+```{r setup, include=FALSE}
+# knitr::opts_chunk$set(echo = FALSE)
+# use kableExtra and knitr options to format table/figure outputs
+# including margins, width, height, digit separator
+library(kableExtra)
+knitr::opts_chunk$set(
+  echo=TRUE, eval=FALSE, prompt=TRUE, comment=NA,
+  dev='png', marginsp=1, fig.cap=' ', fig.width=4, fig.height=3,
+  tidy=TRUE, tidy.opts=list(indent=2, width.cutoff=55))
+knitr::knit_hooks$set(
+  marginsp=function(before, options, envir){
+    if(!before) return()
+    par(mar=c(
+      1.5 + 0.9*options$marginsp, 
+      1.5 + 0.9*options$marginsp,
+      0.2, 0.2), 
+      mgp=c(1.45, 0.45, 0), cex=0.8)},
+  inline = function(x) {
+    prettyNum(x, big.mark=",")})
+
+library(RColorBrewer)
+# plotting configuration
+par(bty='n')
+# colors
+COLORS <- brewer.pal(8, 'Accent')
+
+library(vroom, quietly=TRUE)
+library(tidyverse, quietly=TRUE)
+library(Rtsne, quietly=TRUE)
+library(dbscan, quietly=TRUE)
+```
+
+# Prepare data
+
+## Read data
+
+```{r}
+library(vroom)
+# read rna fpkm from gzip file
+# using vroom::vroom to quickly read from multiple files as a tibble
+fpkms <- vroom(Sys.glob('gdc_download*/*/*.gz'), 
+               delim='\t', col_names=c('gene', 'rna'),
+               id='filename')
+# read link data
+links <- read.table('gdc_sample_sheet.2020-01-30.tsv',
+                   sep='\t', header=TRUE)
+# read clinical data
+clinicals <- read.table('clinical.tsv', 
+                      sep='\t', header=TRUE)
+```
+
+## Transform FPKMs
+
+```{r}
+library(tidyverse)
+# it's also a good idea to standardize the rna's
+# before log-transform, but I won't do it here
+fpkms$logrna <- log10(fpkms$rna + 1)
+logrna <- fpkms %>%
+  pivot_wider(id_cols=filename, 
+              values_from=logrna, 
+              names_from=gene) %>%
+  mutate(case_id=str_split(
+    filename, '/', simplify=TRUE)[,3])
+```
+
+## Join data
+
+```{r}
+# Join links data and clinical data
+df <- clinicals %>%
+  select(submitter_id, vital_status, days_to_death, days_to_last_follow_up,
+         gender, age_at_index, tumor_stage) %>%
+  distinct() %>%
+  inner_join(
+    links %>% select(File.Name, Case.ID), 
+    by = c('submitter_id' = 'Case.ID'))
+```
+
+# Clustering
+
+We will follow the tSNE + HDBSCAN (hierarchical density-based spatial clustering of applications with noise) as outlined in a blog post in Towards Data Science^[Oskolkov, N. (2019). How to cluster in High Dimensions. Towards Data Science. https://towardsdatascience.com/how-to-cluster-in-high-dimensions-4ef693bacc6]. The blog post also has a comparison between different combinations of dimension reduction methods and clustering methods for gene expressison data if you are interested.
+
+First, we need to specify the minimum cluster size for the HDBSCAN algorithm. 
+We will pick the parameter based on a score function. We define the score function as a fraction of cells with low confidence assignment to a cluster based on 5% confidence threshold. The objective is to pick the number of clusters with the minimum score. That is, we want to minimize the number of cases where we are unsure about their cluster assignments. Since tSNE is a stochastic method, We repeat clustering for each number of clusters multiple times (`N_inter=25`).
+
+```{r}
+library(Rtsne) 
+library(dbscan)
+# use parallel processing to speed up the execution
+library(foreach)
+library(doParallel)
+registerDoParallel(cores=4)
+N_iter <- 25
+N_pt <- 10
+N_cells <- dim(logrna)[1]
+score <- vector(length = N_pt-2)
+expr <- logrna %>% 
+  select(-c(filename, case_id))
+# drop all 0 columns
+expr <- expr %>%
+  select(names(expr)[sapply(expr, function(x) !all(x==0))])
+expr <- as.matrix(expr)
+# evaluate for 3 to N_pt number of clusters
+for(i in 3:N_pt)
+{
+  # repeat N_iter times in parallel and get mean score
+  score_iter <- foreach (1:N_iter, .combine = c) %dopar% 
+  {
+    tsne_iter <- Rtsne(expr, max_iter=10000)
+    res <- hdbscan(tsne_iter$Y, minPts = i)
+    score_iter_temp <- sum(res$membership_prob < 0.05) / N_cells
+    return(score_iter_temp)
+  }
+  score[i-2] <- mean(score_iter, na.rm = TRUE)
+}
+# this cell takes a long time...save the resulting object to avoid running it again
+save(logrna, df, score, N_pt, file='save_point.RData')
+```
+
+```{r eval=TRUE}
+load("save_point.RData")
+```
+
+--------
+
+_Check the `.Rmd` file for configuring Figure blocks that generate captions and labels in LaTeX. In text body, the labels are referenced with `Figure \ref{fig:<label-in-block>}`._
+
++   `fig.cap` (string) Figure caption;
++   `fig.subcap` (array) Captions for subfigures if you are placing more than one plot; `\usepackage(subfig)` in the document head is required;
++   `fig.ncol` (integer) Number of columns per row when placing subfigures;
++   `fig.align` (string) Figure alignment; use "center";
++   `out.width`, `fig.width`, `out.height`, `fig.height` (string or integer) Figure dimension; refer to this blog^[https://sebastiansauer.github.io/figure_sizing_knitr/] for details; try different combinations until you are satisfied with the overall size, font size, etc. of the plot displayed on pdf;
+
+--------
+
+```{r eval=TRUE}
+# get the clustering size with the minimum score
+opt_num <- which.min(score) + 2 # started from 3
+```
+
+```{r}
+# perform the final tSNE reduction and HDBSCAN
+# will iterate N_tsne times and pick the best tSNE result
+# based on KL divergence
+N_tsne <- 50
+tsne_out <- list(length = N_tsne)
+KL <- vector(length = N_tsne)
+for(k in 1:N_tsne) 
+{
+  tsne_out[[k]] <- Rtsne(expr, max_iter=10000)
+  # extract KL divergence of the last iteration
+  KL[k] <- tail(tsne_out[[k]]$itercosts, 1) 
+}
+opt_tsne <- tsne_out[[which.min(KL)]]$Y
+res_opt <- hdbscan(opt_tsne, minPts = opt_num)
+# this cell takes a long time...save the resulting object to avoid running it again
+save(opt_tsne, res_opt, file='save_point2.RData')
+```
+
+```{r eval=TRUE}
+load('save_point2.RData')
+```
+
+```{r fig1, eval=TRUE, echo=TRUE, fig.cap="(a) Scores for minimum cluster sizes from 3 to 10. Minimum cluster size of 8~(\\circlegend{color6}) achieves the minimum score.  (b) Clusters based on the optimal minimum cluster size with Cluster 1~(\\dotlegend{color1}), Cluster 2~(\\dotlegend{color2}), Cluster 3~(\\dotlegend{color3}), and Cluster 4~(\\dotlegend{color4}).", fig.subcap=c("Scores", "Clusters"), fig.ncol=2, fig.width=4, out.width=".5\\linewidth", fig.height=3, fig.align="center"}
+# plot the scores
+plot(score ~ seq(from=3, to=N_pt, by=1), type='b',
+     xlab="Minimum Cluster Size", ylab="Score",
+     col=ifelse(score == min(score), COLORS[6], COLORS[8]),
+     axes=FALSE, xlim=c(3,10), ylim=c(0,0.5))
+axis(1, at=seq(3,10))
+axis(2, at=c(0,0.5))
+# plot the final clusters from HDBSCAN
+plot(opt_tsne, pch=19, col=alpha(COLORS[res_opt$cluster + 1], 0.4),
+     xlab='tSNE 1', ylab='tSNE 2', axes=FALSE)
+axis(1)
+axis(2)
+```
+
+Figure \ref{fig:fig1} (a) shows the resulting scores for each minimum cluster sizes from 3 to 10. Minimum clustering size of `r opt_num` achieved the minimum score. Figure \ref{fig:fig1} (b) shows the resulting clusters using minimum clustering size of `r opt_num` for HDBSCAN.
+
+# Survival analysis
+
+## Join data and inspect
+
+```{r eval=TRUE, warning=FALSE}
+# join case_id and clusters
+clusters <- data.frame(
+  case_id = as.character(logrna$case_id),
+  rna_cluster = res_opt$cluster + 1, # start from 1
+  stringsAsFactors = FALSE
+)
+# 1. join clinical data and clusters
+# 2. remove rows with no vital status
+# 3. code survival event and number of days
+# 4. drop rows with missing number of days
+# 5. fix other data types
+df_final <- clusters %>%
+  inner_join(df %>% mutate(File.Name = as.character(File.Name)),
+             by=c('case_id'='File.Name')) %>%
+  filter(vital_status != 'Not Reported') %>% 
+  mutate(
+    outcome = if_else(vital_status == 'Alive', 0 ,1),
+    days = if_else(
+      vital_status == 'Alive', 
+      # using as.numeric only will extract the factor order not the value
+      as.numeric(as.character(days_to_last_follow_up)),
+      as.numeric(as.character(days_to_death)))
+  ) %>%
+  drop_na(days) %>%
+  mutate(
+    age=as.numeric(as.character(age_at_index))
+  )
+```
+
+_Check the `.Rmd` file for configuring tables blocks that generate captions and labels in LaTeX using `knitr::kable`. In text body, the labels are referenced with `Table \ref{tab:<label-in-block>}`._
+
+Table \ref{tab:genderTab} and Figure \ref{fig:stageCnt} show the number of cases for gender and tumor stage respectively by cluster. Cases in tumor stages III and beyond are grouped as the number of patients in these later stages are small.
+
+```{r genderTab, echo=TRUE}
+gender_table <- table(df_final$gender, df_final$rna_cluster)
+row.names(gender_table) <- str_to_upper(row.names(gender_table))
+colnames(gender_table) <- sapply(
+  colnames(gender_table), function(x) paste('Cluster', x))
+knitr::kable(
+  gender_table,
+  caption='Count of patient records by gender and cluster.',
+  digits=2, booktabs=TRUE, escape=FALSE
+) %>%
+  kable_styling(latex_options=c(
+    'hold_position'
+  ))
+```
+
+```{r stageCnt, eval=TRUE, echo=TRUE, fig.cap="Counts of patients by tumor stages and clusters - Cluster 1~(\\barlegend{color1}), Cluster 2~(\\barlegend{color2}), Cluster 3~(\\barlegend{color3}), and Cluster 4~(\\barlegend{color4}). Patients without reported tumor stages (n=32) are not displayed", fig.width=4, out.width=".8\\linewidth", fig.height=3, fig.align="center"}
+stage_table <- table(df_final$tumor_stage, df_final$rna_cluster)
+row.names(stage_table) <- str_to_upper(row.names(stage_table))
+colnames(stage_table) <- sapply(
+  colnames(stage_table), function(x) paste('Cluster', x))
+par(mar=c(4,8,4,2))
+barplot(t(stage_table[10:2,]), 
+        col = COLORS, border=NA, 
+        hori =TRUE, axes=FALSE, las=2)
+axis(1, las=0)
+axis(2, tick=FALSE, line=NA, lty=0, labels=FALSE)
+```
+
+
+```{r eval=TRUE}
+# group tumor stages
+df_surv <- df_final %>%
+  select(outcome, days, age, rna_cluster, gender, tumor_stage) %>%
+  mutate(tumor_stage =  if_else(
+    str_starts(as.character(tumor_stage), 'stage i((ii)|(v))'),
+    'stage iii+', as.character(tumor_stage)))
+```
+
+## Survival rates vs. clusters
+
+The Kaplan-Meier cuves in Figure \ref{fig:kmCluster} show different survival rates for the four clusters identified above. In order to test whether the differences are statistically significant, we will use the log-rank test.
+
+```{r kmCluster, eval=TRUE, echo=TRUE, fig.cap="Kaplan-Meier curves for each cluster - Cluster 1~(\\linlegend{color1}), Cluster 2~(\\linlegend{color2}), Cluster 3~(\\linlegend{color3}), and Cluster 4~(\\linlegend{color4}).", fig.width=4, out.width=".8\\linewidth", fig.height=3, fig.align="center"}
+library(survival, quietly=TRUE)
+# KM plots
+km_cluster <- survfit(
+  Surv(days, outcome) ~ factor(rna_cluster),
+  data=df_surv)
+plot(km_cluster, col=COLORS, axes=FALSE,
+     xlab='Day', ylab='Survival', ylim=c(0,1))
+grid()
+axis(1)
+axis(2, at=c(0,0.5,1))
+```
+
+```{r lrankRes, eval=TRUE, echo=TRUE}
+lrank_cluster <- survdiff(
+  Surv(days, outcome) ~ factor(rna_cluster),
+  data=df_surv, 
+  rho=0 # log-rank test
+  )
+lrank_tab <- data.frame(
+  N = as.vector(lrank_cluster$n),
+  Observed = lrank_cluster$obs,
+  Expected = lrank_cluster$exp,
+  row.names = sapply(
+    sort(unique(df_surv$rna_cluster)), 
+    function(x) paste('Cluster', x))
+)
+# calculate p value
+lrank_pval <- pchisq(
+  lrank_cluster$chisq, 
+  df=length(lrank_cluster$n)-1, 
+  lower.tail=FALSE)
+knitr::kable(
+  lrank_tab,
+  row.names = TRUE,
+  col.names = c('Number of Patients', 'Observed', 'Expected'),
+  caption=paste0(
+    'Observed and expected numbers of deaths for each cluster if their survival curves were identical. From the log-rank test, the chisquare statistic is ',
+    round(lrank_cluster$chisq,2), ' with p-value of ',
+    round(lrank_pval,3), '.'),
+  digits=2, booktabs=TRUE, escape=FALSE
+) %>%
+  kable_styling(latex_options=c(
+    'hold_position'
+  ))
+```
+
+Table \ref{tab:lrankRes} shows the observed and expected numbers of deaths for each cluster.The numbers of observed deaths are smaller than the expected numbers for Cluster 1 and Cluster 3 while Cluster 2 and Cluster 4 display the opposite result. You can also see from Figure \ref{fig:kmCluster} that patients in Cluster 1 and Cluster 3 have higher survival rates in general. The p-value of the test is `r round(lrank_pval,3)` indicating that the differences in the survival rates between clusters aren't significant at 5\% significance level. Although we fail to reject the null hypothesis that different clusters share a common survival curve at 5\% significance level, we note the p-value is quite close to 5\%.
+
+```{r coxRes, eval=TRUE, echo=TRUE}
+cox_cluster <- coxph(
+  Surv(days, outcome) ~ factor(rna_cluster),
+  data=df_surv
+)
+ci_cluster <- summary(cox_cluster)$conf.int
+row.names(ci_cluster) <- sapply(
+  sort(unique(df_surv$rna_cluster)), 
+  function(x) paste('Cluster', x))[-1]
+knitr::kable(
+  ci_cluster[,-2],
+  row.names = TRUE,
+  col.names = c('Hazard Ratio', 'Lower CI', 'Upper CI'),
+  caption='Estimated hazard ratios of clusters with respect to Cluster 1 and their 95\\% confidence bounds.',
+  digits=2, booktabs=TRUE, escape=FALSE
+) %>%
+  kable_styling(latex_options=c(
+    'hold_position'
+  ))
+```
+
+We can also fit a proportional hazard model and check whether the clusters have significant effect on the hazard function. Table \ref{tab:coxRes} shows the estimated hazard ratios for each cluster with respect to Cluster 1. The confidence intervals indicate that Cluster 2 has a significant effect at 5\% significance level. Patients in Cluster 2 have twice of the risk compared to those in Cluster 1. 
+
+```{r coxDiag, eval=TRUE, echo=FALSE, fig.cap="Diagnosis plots for the proportional hazard model with clusters - Cluster 1~(\\linlegend{color1}), Cluster 2~(\\linlegend{color2}), Cluster 3~(\\linlegend{color3}), and Cluster 4~(\\linlegend{color4}).", fig.subcap=c("Fitted~(\\linlegend{color8}) vs. observed~(\\dashlegend{color8}).", "Log-log plot."), fig.ncol=2, fig.width=4, out.width=".5\\linewidth", fig.height=3, fig.align="center"}
+# plot the fitted vs. observed (KM)
+# fit on the 4 clusters
+fitted_cluster <- survfit(
+  cox_cluster, 
+  newdata=data.frame(rna_cluster=factor(1:4)),
+  conf.type='plain')
+plot(
+  fitted_cluster, col=COLORS, axes=FALSE,
+  xlab='Day', ylab='Survival', ylim=c(0,1))
+lines(km_cluster, type='s', col=COLORS, lty=2)
+grid()
+axis(1)
+axis(2, at=c(0,0.5,1))
+
+# plot the log-log plot
+plot(km_cluster, col=COLORS, fun='cloglog',
+     xlab='Day', ylab='log(-log(Survival))',
+     axes=FALSE)
+grid()
+axis(1, 
+     at=c(1,5,10,100,500,5000), 
+     labels=c(0,5,10,100,500,NA))
+axis(2)
+```
+
+The proportional hazard model assumes hazard ratios are constant over time. In order to diagnose the model assumptions, we can use various graphical approaches. In Figure \ref{fig:coxDiag} (a), the fitted curve for Cluster 3 is inconsistent with the observed cuve while other fitted curves follow the observed curves in general. Parallel lines in a log-log plot would suggest the proportional hazard assumption. We can observe the Cluster 3 curve in Figure \ref{fig:coxDiag} (b) moving in a different direction while the other three lines are parallel.
+
+
+## Effect of covariates
+
+In order to analyse whether different tumor stages change the effect of the clusters on survival, we will fit another Cox model with tumor size variable added. (I won't repeat it for gender.) The estimated hazard ratios and thier 95\% confidence intervals are shown in Figure \ref{fig:stageRes}. The estimates for interaction terms aren't significant.
+
+```{r stageRes, eval=TRUE, echo=FALSE, fig.cap="Estimated hazard ratios~(\\dotlegend{color8}) and 95\\% confidence intervals~(\\linlegend{color8}) with respect to Cluster 1 in Stage I.", fig.width=4, out.width=".8\\linewidth", fig.height=4, fig.align="center"}
+cox_stage <- coxph(
+  Surv(days, outcome) ~ factor(rna_cluster)*tumor_stage,
+  # exclude those with tumor stage not reported (n=32)
+  data=df_surv %>% filter(tumor_stage != 'not reported')
+)
+ci_stage <- summary(cox_stage)$conf.int
+row.names(ci_stage) <- str_replace_all(
+  row.names(ci_stage), 'factor\\(rna_cluster\\)', 'Cluster ')
+row.names(ci_stage) <- str_replace_all(
+  row.names(ci_stage), 'tumor_stagestage', 'Stage')
+row.names(ci_stage) <- str_replace_all(
+  row.names(ci_stage), 'Stage iii', 'Stage III')
+row.names(ci_stage) <- str_replace_all(
+  row.names(ci_stage), 'Stage ii', 'Stage II')
+# plot CIs
+par(mar=c(4,8,4,2))
+plot(NA, type='n',
+     xlab='Hazard Ratio', ylab='', axes=FALSE, 
+     xlim=c(-3.5,3.5), ylim=c(1,11))
+grid()
+abline(v=0, col=COLORS[6], lty=2)
+# confidence intervals
+for(j in 1:11) {
+  lines(log(ci_stage[11-j+1, 3:4]), c(j,j), col=COLORS[8])
+}
+points(rev(log(ci_stage[,1])), 1:11, 
+       pch=19, col=COLORS[8])
+axis(
+  1, at=c(log(0.05), log(0.1), 0, log(10), log(30)),
+  labels=c(0.05, 0.1, 1, 10, 30))
+axis(
+  2, at=1:11, labels=rev(row.names(ci_stage)), 
+  las=2, cex.axis=0.7)
+```
